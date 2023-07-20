@@ -110,3 +110,9 @@ def argparser():
     parser.add_argument("--poa", action="store_true", default=False)
     parser.add_argument("--min-coverage", default=0.5, type=float)
     return parser
+
+if __name__ == '__main__':
+    # Execute only if run as the entry point into the program
+    parser = argparser()
+    m_args = parser.parse_args()
+    main(m_args)

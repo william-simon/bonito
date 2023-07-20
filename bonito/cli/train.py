@@ -126,3 +126,8 @@ def argparser():
     parser.add_argument("--grad-accum-split", default=1, type=int)
     parser.add_argument("--quantile-grad-clip", action="store_true", default=False)
     return parser
+
+if __name__ == "__main__":
+    parser = argparser()
+    args = parser.parse_args()
+    main(args)
