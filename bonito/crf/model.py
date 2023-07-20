@@ -24,30 +24,43 @@ def get_stride(m):
     return np.prod([get_stride(c) for c in children])
 
 
+def twoD_softmax(mat):
+    return torch.flatten(mat,start_dim=-2).softmax(-1).reshape(*mat.shape)
+
 class CTC_CRF(SequenceDist):
 
-    def __init__(self, state_len, alphabet, n_pre_context_bases=0, n_post_context_bases=0):
+    def __init__(self, state_len, alphabet, n_pre_context_bases=0, n_post_context_bases=0, probs_method="ont", traceback_method="ont"):
         super().__init__()
+        print(f'{probs_method}')
         self.alphabet = alphabet
         self.state_len = state_len
         self.n_pre_context_bases = n_pre_context_bases
         self.n_post_context_bases = n_post_context_bases
         self.n_base = len(alphabet[1:])
+        self.num_rows = self.n_base**self.state_len
+        num_trans = self.num_rows * (self.n_base+1) # +1 for the blank value
         self.idx = torch.cat([
-            torch.arange(self.n_base**(self.state_len))[:, None],
-            torch.arange(
-                self.n_base**(self.state_len)
+            torch.arange(self.num_rows)[:, None],
+            torch.arange(self.num_rows
             ).repeat_interleave(self.n_base).reshape(self.n_base, -1).T
-        ], dim=1).to(torch.int32)
-
+        ], dim=1).to(torch.int64)
+        next_trans_idx = torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]
+        next_blank_idx = torch.arange(0,num_trans, self.n_base + 1).reshape(self.n_base, -1).T
+        self.next_idx = torch.cat([next_trans_idx[i] if i%self.n_base != 0 else \
+                                torch.cat([next_blank_idx[i//self.n_base],next_trans_idx[i]]) \
+                                for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).to(torch.int64)
+        t = torch.arange(self.num_rows)
+        self.next_reorder = torch.cat([t[i::4] for i in range(4)])
+        self.probs_method, self.probs_lookAhead = probs_method.split('_') if probs_method != "ont" else ("ont",-1)
+        self.traceback_method, self.traceback_lookAhead = traceback_method.split('_') if traceback_method != "ont" else ("ont",-1)
     def n_score(self):
-        return len(self.alphabet) * self.n_base**(self.state_len)
+        return len(self.alphabet) * self.num_rows
 
     def logZ(self, scores, S:semiring=Log):
         T, N, _ = scores.shape
         Ms = scores.reshape(T, N, -1, len(self.alphabet))
-        alpha_0 = Ms.new_full((N, self.n_base**(self.state_len)), S.one)
-        beta_T = Ms.new_full((N, self.n_base**(self.state_len)), S.one)
+        alpha_0 = Ms.new_full((N, self.num_rows), S.one)
+        beta_T = Ms.new_full((N, self.num_rows), S.one)
         return logZ_cu_sparse(Ms, self.idx, alpha_0, beta_T, S)
 
     def normalise(self, scores):
@@ -56,13 +69,13 @@ class CTC_CRF(SequenceDist):
     def forward_scores(self, scores, S: semiring=Log):
         T, N, _ = scores.shape
         Ms = scores.reshape(T, N, -1, self.n_base + 1)
-        alpha_0 = Ms.new_full((N, self.n_base**(self.state_len)), S.one)
+        alpha_0 = Ms.new_full((N, self.num_rows), S.one)
         return fwd_scores_cu_sparse(Ms, self.idx, alpha_0, S, K=1)
 
     def backward_scores(self, scores, S: semiring=Log):
         T, N, _ = scores.shape
         Ms = scores.reshape(T, N, -1, self.n_base + 1)
-        beta_T = Ms.new_full((N, self.n_base**(self.state_len)), S.one)
+        beta_T = Ms.new_full((N, self.num_rows), S.one)
         return bwd_scores_cu_sparse(Ms, self.idx, beta_T, S, K=1)
 
     def compute_transition_probs(self, scores, betas):
@@ -94,9 +107,47 @@ class CTC_CRF(SequenceDist):
         )
         return torch.cat([blanks, emissions], dim=-1).reshape(T, N, -1)
 
+    def chain_scores(self, inputs):
+        # with torch.no_grad():
+            L, B, NR, NB = inputs.shape[0], inputs.shape[1], self.num_rows, self.n_base
+            inputs = inputs.detach().reshape(L, B, NR, NB+1)
+            probs = inputs.clone()
+            cs = torch.zeros_like(inputs)
+            lhSoft = int(self.probs_lookAhead)
+            lhMax = int(self.traceback_lookAhead)
+            idx = self.idx.to(inputs.device).detach()
+            next_idx = self.next_idx.to(inputs.device).detach()
+            num_trans = NR * (NB+1) # +1 for the blank value
+            for i in range(1,B):
+                idx = torch.concat((idx,idx[0:NR] + i*NR))
+                next_idx = torch.concat((next_idx,next_idx[0:NB+1] + i*num_trans))
+            for i in range(1,L):
+                l = torch.take(probs[i-1].logsumexp(-1),idx).reshape(B,NR,NB+1)
+                probs[i] += l - l.min(-1)[0].min(-1)[0].reshape(-1,1,1)
+                if i >= lhSoft:
+                    r = torch.take(probs[i],next_idx).reshape(-1,NB+1,NB).logsumexp(1).unsqueeze(1).permute(0,2,1)
+                    for j in range(1,lhSoft):
+                        r = torch.take(probs[i-j]+r-r.min(1)[0].unsqueeze(1),next_idx).reshape(-1,NB+1,NB).logsumexp(1).unsqueeze(1).permute(0,2,1)
+                    probs[i-lhSoft] +=  r
+                    cs[i-lhSoft] = (twoD_softmax(probs[i-lhSoft])+1e-7).log()
+                    if i > lhSoft:
+                        l = torch.take(cs[i-lhSoft-1].max(-1)[0],idx).reshape(B,NR,NB+1)
+                        cs[i-lhSoft] += l - l.min(-1)[0].min(-1)[0].reshape(-1,1,1)
+                        if i >= lhSoft + lhMax:
+                            r = torch.take(cs[i-lhSoft],next_idx).reshape(-1,NB+1,NB).max(1)[0].unsqueeze(1).permute(0,2,1)
+                            for j in range(1,lhMax):
+                                r = torch.take(cs[i-lhSoft-j] + r - r.min(1)[0].unsqueeze(1),next_idx).reshape(-1,NB+1,NB).max(1)[0].unsqueeze(1).permute(0,2,1)
+                            cs[i-lhSoft-lhMax] += r
+            # for i in range(1,lhSoft): # There is uncompleted code here for finishing the chain score
+            #     probs[L-i-1] = probs[L-i] + torch.take(probs[L-i],next_idx).reshape(-1,NB+1,NB).logsumexp(1).T.reshape(-1,1)
+            return cs.reshape(L,B,-1)
+
     def viterbi(self, scores):
-        traceback = self.posteriors(scores, Max)
-        a_traceback = traceback.argmax(2)
+        if self.traceback_method == 'ont':
+            traceback = self.posteriors(scores, Max)
+        elif self.traceback_method == 'chain':
+            traceback = self.chain_scores(scores)
+        a_traceback = traceback.argmax(-1)
         moves = (a_traceback % len(self.alphabet)) != 0
         paths = 1 + (torch.div(a_traceback, len(self.alphabet), rounding_mode="floor") % self.n_base)
         return torch.where(moves, paths, 0)
@@ -114,7 +165,7 @@ class CTC_CRF(SequenceDist):
         scores = scores.to(torch.float32)
         n = targets.size(1) - (self.state_len - 1)
         stay_indices = sum(
-            targets[:, i:n + i] * self.n_base ** (self.state_len - i - 1)
+            targets[:, i:n + i] * (self.n_base ** (self.state_len - i - 1))
             for i in range(self.state_len)
         ) * len(self.alphabet)
         move_indices = stay_indices[:, 1:] + targets[:, :n - 1] + 1
@@ -178,9 +229,16 @@ class SeqdistModel(Module):
         return self.encoder(x)
 
     def decode_batch(self, x):
-        scores = self.seqdist.posteriors(x.to(torch.float32)) + 1e-8
-        tracebacks = self.seqdist.viterbi(scores.log()).to(torch.int16).T
-        return [self.seqdist.path_to_str(x) for x in tracebacks.cpu().numpy()]
+        if self.seqdist.probs_method == 'ont':
+            scores = (self.seqdist.posteriors(x.to(torch.float32)) + 1e-8).log()
+        elif self.seqdist.probs_method == "chain":
+            scores = x
+        else:
+            raise ValueError(f'Unknown decode method {self.seqdist.probs_method}')
+        tracebacks = self.seqdist.viterbi(scores).to(torch.int16).T
+        bases = [self.seqdist.path_to_str(x) for x in tracebacks.cpu().numpy()]
+        return bases
+    
 
     def decode(self, x):
         return self.decode_batch(x.unsqueeze(1))[0]
@@ -202,7 +260,9 @@ class Model(SeqdistModel):
     def __init__(self, config):
         seqdist = CTC_CRF(
             state_len=config['global_norm']['state_len'],
-            alphabet=config['labels']['labels']
+            alphabet=config['labels']['labels'],
+            probs_method='ont' if 'probs_method' not in config else config['probs_method'],
+            traceback_method='ont' if 'traceback_method' not in config else config['traceback_method'],
         )
         if 'type' in config['encoder']: #new-style config
             encoder = from_dict(config['encoder'])

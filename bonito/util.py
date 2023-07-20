@@ -236,6 +236,8 @@ def load_symbol(config, symbol):
         else:
             dirname = config
         config = toml.load(os.path.join(dirname, 'config.toml'))
+    if not "probs_method" in config: config['probs_method'] = 'ont'
+    if not "probs_method" in config: config['traceback_method'] = 'ont'
     imported = import_module(config['model']['package'])
     return getattr(imported, symbol)
 
@@ -272,7 +274,7 @@ def set_config_defaults(config, chunksize=None, batchsize=None, overlap=None, qu
     return config
 
 
-def load_model(dirname, device, weights=None, half=None, chunksize=None, batchsize=None, overlap=None, quantize=False, use_koi=False):
+def load_model(dirname, device, weights=None, probs_method="ont", traceback_method="ont", half=None, chunksize=None, batchsize=None, overlap=None, quantize=False, use_koi=False):
     """
     Load a model config and weights off disk from `dirname`.
     """
@@ -281,6 +283,8 @@ def load_model(dirname, device, weights=None, half=None, chunksize=None, batchsi
     weights = get_last_checkpoint(dirname) if weights is None else os.path.join(dirname, 'weights_%s.tar' % weights)
     config = toml.load(os.path.join(dirname, 'config.toml'))
     config = set_config_defaults(config, chunksize, batchsize, overlap, quantize)
+    config['probs_method'] = probs_method
+    config['traceback_method'] = traceback_method
     return _load_model(weights, config, device, half, use_koi)
 
 

@@ -45,7 +45,7 @@ def main(args):
         seqs = []
 
         print("* loading model", w)
-        model = load_model(args.model_directory, args.device, weights=w)
+        model = load_model(args.model_directory, args.device, probs_method=args.probs_method, traceback_method=args.traceback_method, weights=w)
 
         print("* calling")
         t0 = time.perf_counter()
@@ -106,6 +106,8 @@ def argparser():
     parser.add_argument("--weights", default="0", type=str)
     parser.add_argument("--chunks", default=1000, type=int)
     parser.add_argument("--batchsize", default=96, type=int)
+    parser.add_argument("--probs_method",default="ont")
+    parser.add_argument("--traceback_method",default="ont")
     parser.add_argument("--beamsize", default=5, type=int)
     parser.add_argument("--poa", action="store_true", default=False)
     parser.add_argument("--min-coverage", default=0.5, type=float)
