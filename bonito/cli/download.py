@@ -155,3 +155,8 @@ def argparser():
     parser.add_argument('--list', '--show', dest='show', action='store_true')
     parser.add_argument('-f', '--force', action='store_true')
     return parser
+
+if __name__ == "__main__":
+    parser = argparser()
+    args = parser.parse_args()
+    main(args)
