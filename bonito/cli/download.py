@@ -127,6 +127,9 @@ def main(args):
     """
     Download models and training sets
     """
+    if args.path != "":
+        __models__ = os.path.join(args.path, "models")
+        __data__ = os.path.join(args.path, "data")
     if args.models or args.all:
         
         if args.show:
@@ -148,6 +151,7 @@ def argparser():
         formatter_class=ArgumentDefaultsHelpFormatter,
         add_help=False
     )
+    parser.add_argument('--path', default="")
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--all', action='store_true')
     group.add_argument('--models', action='store_true')
