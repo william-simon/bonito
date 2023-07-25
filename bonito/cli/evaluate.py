@@ -65,10 +65,10 @@ def main(args):
 
                     log_probs = model(data)
                     if(args.save_DNN_output): # Save DNN outputs so DNN doesn't have to be called every time we want to run decoding
-                        torch.save(log_probs.cpu(),os.path.join(saveDir,f'output_{i}'))
+                        torch.save(log_probs.cpu(),os.path.join(saveDir,f'output_{i}.tensor'))
                 else: # Fast mode: Only run the decoding with the presaved values
                     loadDir = os.path.join(args.directory,'../DNNOutput',os.path.basename(args.model_directory))
-                    log_probs = torch.load(os.path.join(loadDir, f'output_{i}'), map_location=args.device)
+                    log_probs = torch.load(os.path.join(loadDir, f'output_{i}.tensor'), map_location=args.device)
                 
                 if hasattr(model, 'decode_batch'):
                     seqs.extend(model.decode_batch(log_probs)) # <---- Here is where decoding is called
