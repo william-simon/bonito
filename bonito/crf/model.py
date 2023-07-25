@@ -29,9 +29,9 @@ def twoD_softmax(mat):
 
 class CTC_CRF(SequenceDist):
 
-    def __init__(self, state_len, alphabet, n_pre_context_bases=0, n_post_context_bases=0, probs_method="ont", traceback_method="ont"):
+    def __init__(self, state_len, alphabet, n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
         super().__init__()
-        print(f'{probs_method}')
+        print(f'{decode_method}')
         self.alphabet = alphabet
         self.state_len = state_len
         self.n_pre_context_bases = n_pre_context_bases
@@ -51,8 +51,7 @@ class CTC_CRF(SequenceDist):
                                 for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).to(torch.int64)
         t = torch.arange(self.num_rows)
         self.next_reorder = torch.cat([t[i::4] for i in range(4)])
-        self.probs_method, self.probs_lookAhead = probs_method.split('_') if probs_method != "ont" else ("ont",-1)
-        self.traceback_method, self.traceback_lookAhead = traceback_method.split('_') if traceback_method != "ont" else ("ont",-1)
+        self.decode_method, self.probs_lookAhead, self.traceback_lookAhead = decode_method.split('_') if decode_method != "ont" else ("ont",-1,-1)
     def n_score(self):
         return len(self.alphabet) * self.num_rows
 
@@ -107,7 +106,7 @@ class CTC_CRF(SequenceDist):
         )
         return torch.cat([blanks, emissions], dim=-1).reshape(T, N, -1)
 
-    def chain_scores(self, inputs):
+    def lookaround_scores(self, inputs):
         # with torch.no_grad():
             L, B, NR, NB = inputs.shape[0], inputs.shape[1], self.num_rows, self.n_base
             inputs = inputs.detach().reshape(L, B, NR, NB+1)
@@ -138,15 +137,15 @@ class CTC_CRF(SequenceDist):
                             for j in range(1,lhMax):
                                 r = torch.take(cs[i-lhSoft-j] + r - r.min(1)[0].unsqueeze(1),next_idx).reshape(-1,NB+1,NB).max(1)[0].unsqueeze(1).permute(0,2,1)
                             cs[i-lhSoft-lhMax] += r
-            # for i in range(1,lhSoft): # There is uncompleted code here for finishing the chain score
+            # for i in range(1,lhSoft): # There is uncompleted code here for finishing the lookaround score
             #     probs[L-i-1] = probs[L-i] + torch.take(probs[L-i],next_idx).reshape(-1,NB+1,NB).logsumexp(1).T.reshape(-1,1)
             return cs.reshape(L,B,-1)
 
     def viterbi(self, scores):
-        if self.traceback_method == 'ont':
+        if self.decode_method == 'ont':
             traceback = self.posteriors(scores, Max)
-        elif self.traceback_method == 'chain':
-            traceback = self.chain_scores(scores)
+        elif self.decode_method == 'lookaround':
+            traceback = self.lookaround_scores(scores)
         a_traceback = traceback.argmax(-1)
         moves = (a_traceback % len(self.alphabet)) != 0
         paths = 1 + (torch.div(a_traceback, len(self.alphabet), rounding_mode="floor") % self.n_base)
@@ -229,9 +228,9 @@ class SeqdistModel(Module):
         return self.encoder(x)
 
     def decode_batch(self, x):
-        if self.seqdist.probs_method == 'ont':
+        if self.seqdist.decode_method == 'ont':
             scores = (self.seqdist.posteriors(x.to(torch.float32)) + 1e-8).log()
-        elif self.seqdist.probs_method == "chain":
+        elif self.seqdist.decode_method == "lookaround":
             scores = x
         else:
             raise ValueError(f'Unknown decode method {self.seqdist.probs_method}')
@@ -261,8 +260,7 @@ class Model(SeqdistModel):
         seqdist = CTC_CRF(
             state_len=config['global_norm']['state_len'],
             alphabet=config['labels']['labels'],
-            probs_method='ont' if 'probs_method' not in config else config['probs_method'],
-            traceback_method='ont' if 'traceback_method' not in config else config['traceback_method'],
+            decode_method='ont' if 'decode_method' not in config else config['decode_method'],
         )
         if 'type' in config['encoder']: #new-style config
             encoder = from_dict(config['encoder'])
