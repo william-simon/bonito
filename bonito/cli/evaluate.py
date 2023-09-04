@@ -2,6 +2,7 @@
 Bonito model evaluator
 """
 
+x = 1
 import os
 import time
 import torch
@@ -56,6 +57,8 @@ def main(args):
             os.makedirs(saveDir, exist_ok=True)
         with torch.no_grad():
             for (i,(data, target, *_)) in enumerate(dataloader):
+                if(i == 10):
+                    break
                 targets.extend(torch.unbind(target, 0))
                 if not args.load_DNN_output: # Standard mode: run the DNN with the validation data
                     if half_supported():

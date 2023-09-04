@@ -6,12 +6,14 @@ import torch
 import numpy as np
 
 import koi
+import math
 from koi.ctc import SequenceDist, Max, Log, semiring
 from koi.ctc import logZ_cu, viterbi_alignments, logZ_cu_sparse, bwd_scores_cu_sparse, fwd_scores_cu_sparse
 
 from bonito.nn import Module, Convolution, LinearCRFEncoder, Serial, Permute, layers, from_dict
 
-
+def maxx(inp, dim):
+    return torch.max(inp, dim)[0]
 def get_stride(m):
     children = list(m.children())
     if len(children) == 0:
@@ -51,7 +53,13 @@ class CTC_CRF(SequenceDist):
                                 for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).to(torch.int64)
         t = torch.arange(self.num_rows)
         self.next_reorder = torch.cat([t[i::4] for i in range(4)])
-        self.decode_method, self.probs_lookAhead, self.traceback_lookAhead = decode_method.split('_') if decode_method != "ont" else ("ont",-1,-1)
+        if decode_method != "ont":
+            self.decode_method, self.probs_lookAhead, self.traceback_lookAhead = decode_method.split('_')
+            self.probs_lookAhead = int(self.probs_lookAhead)
+            self.traceback_lookAhead = int(self.traceback_lookAhead)
+        else:
+            self.decode_method, self.probs_lookAhead, self.traceback_lookAhead = "ont", -1, -1
+            
     def n_score(self):
         return len(self.alphabet) * self.num_rows
 
@@ -105,47 +113,71 @@ class CTC_CRF(SequenceDist):
             self.state_len + 1).reshape(T, N, -1, self.n_base), [0, 2, 3]
         )
         return torch.cat([blanks, emissions], dim=-1).reshape(T, N, -1)
-
-    def lookaround_scores(self, inputs):
-        # with torch.no_grad():
-            L, B, NR, NB = inputs.shape[0], inputs.shape[1], self.num_rows, self.n_base
-            inputs = inputs.detach().reshape(L, B, NR, NB+1)
-            probs = inputs.clone()
-            cs = torch.zeros_like(inputs)
-            lhSoft = int(self.probs_lookAhead)
-            lhMax = int(self.traceback_lookAhead)
-            idx = self.idx.to(inputs.device).detach()
-            next_idx = self.next_idx.to(inputs.device).detach()
-            num_trans = NR * (NB+1) # +1 for the blank value
-            for i in range(1,B):
-                idx = torch.concat((idx,idx[0:NR] + i*NR))
-                next_idx = torch.concat((next_idx,next_idx[0:NB+1] + i*num_trans))
-            for i in range(1,L):
-                l = torch.take(probs[i-1].logsumexp(-1),idx).reshape(B,NR,NB+1)
-                probs[i] += l - l.min(-1)[0].min(-1)[0].reshape(-1,1,1)
-                if i >= lhSoft:
-                    r = torch.take(probs[i],next_idx).reshape(-1,NB+1,NB).logsumexp(1).unsqueeze(1).permute(0,2,1)
-                    for j in range(1,lhSoft):
-                        r = torch.take(probs[i-j]+r-r.min(1)[0].unsqueeze(1),next_idx).reshape(-1,NB+1,NB).logsumexp(1).unsqueeze(1).permute(0,2,1)
-                    probs[i-lhSoft] +=  r
-                    cs[i-lhSoft] = (twoD_softmax(probs[i-lhSoft])+1e-7).log()
-                    if i > lhSoft:
-                        l = torch.take(cs[i-lhSoft-1].max(-1)[0],idx).reshape(B,NR,NB+1)
-                        cs[i-lhSoft] += l - l.min(-1)[0].min(-1)[0].reshape(-1,1,1)
-                        if i >= lhSoft + lhMax:
-                            r = torch.take(cs[i-lhSoft],next_idx).reshape(-1,NB+1,NB).max(1)[0].unsqueeze(1).permute(0,2,1)
-                            for j in range(1,lhMax):
-                                r = torch.take(cs[i-lhSoft-j] + r - r.min(1)[0].unsqueeze(1),next_idx).reshape(-1,NB+1,NB).max(1)[0].unsqueeze(1).permute(0,2,1)
-                            cs[i-lhSoft-lhMax] += r
-            # for i in range(1,lhSoft): # There is uncompleted code here for finishing the lookaround score
-            #     probs[L-i-1] = probs[L-i] + torch.take(probs[L-i],next_idx).reshape(-1,NB+1,NB).logsumexp(1).T.reshape(-1,1)
-            return cs.reshape(L,B,-1)
+    
+    # This is the original ONT algorithm, it should produce identical results to the C++ ONT code
+    def ont_back_engineered(self, x, fxn):
+        T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
+        inputs = x.detach().reshape(T, B, NR, NB+1)
+        alpha_vals = inputs.new_full((T, B, NR, NB+1), 0.)
+        beta_vals = inputs.new_full((T, B, NR), math.log(1/NR))
+        alpha_plus_beta = torch.zeros_like(inputs)
+        output = torch.zeros_like(inputs)
+        logZ = inputs.new_full((NR,NB,),0.)
+        idx = self.idx.to(dtype=torch.int64, device=inputs.device)
+        next_idx = self.next_idx.to(dtype=torch.int64, device=inputs.device)
+        
+        for i in range(T):
+            alpha_vals[i] = inputs[i] + torch.take(logZ,idx)
+            logZ = fxn(alpha_vals[i],-1)
+        output[T-1] = (alpha_vals[T-1] - fxn(alpha_vals[T-1].flatten(), 0)).exp()
+        for j in reversed(range(T-1)):
+            beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
+            alpha_plus_beta = alpha_vals[j] + beta_vals[j].unsqueeze(-1)
+            z = fxn(alpha_plus_beta.flatten(), 0)
+            output[j] = (alpha_plus_beta - z).exp()
+            
+        return output.reshape([T,B,-1])
+    
+    # This code is nearly identical to the above code, except that the reversed for loop that calculates the
+    # beta values can start early within the first for loop, as dictated by the lookaround (la) value 
+    # passed to it.
+    def la_v2(self, x, fxn, la = -1):
+        T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
+        la = la if la > -1 else T
+        inputs = x.detach().reshape(T, B, NR, NB+1)
+        alpha_vals = inputs.new_full((T, B, NR, NB+1), 0.)
+        beta_vals = inputs.new_full((T, B, NR), math.log(1/NR))
+        alpha_plus_beta = torch.zeros_like(inputs)
+        output = torch.zeros_like(inputs)
+        logZ = inputs.new_full((NR,NB,),0.)
+        idx = self.idx.to(dtype=torch.int64, device=inputs.device)
+        next_idx = self.next_idx.to(dtype=torch.int64, device=inputs.device)
+        for i in range(T):
+            alpha_vals[i] = inputs[i] + torch.take(logZ,idx)
+            logZ = fxn(alpha_vals[i],-1)
+            if i >= la:
+                for j in reversed(range(i-la, i)):
+                    beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
+                    
+                alpha_plus_beta = alpha_vals[i-la] + beta_vals[i-la].unsqueeze(-1)
+                z = fxn(alpha_plus_beta.flatten(), 0)
+                output[i-la] = (alpha_plus_beta - z).exp()
+        output[T-1] = (alpha_vals[T-1] - fxn(alpha_vals[T-1].flatten(), 0)).exp()
+        for j in reversed(range(T-la,T-1)):
+            beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
+                    
+            alpha_plus_beta = alpha_vals[j] + beta_vals[j].unsqueeze(-1)
+            z = fxn(alpha_plus_beta.flatten(), 0)
+            output[j] = (alpha_plus_beta - z).exp()
+            
+        return output.reshape([T,B,-1])
 
     def viterbi(self, scores):
         if self.decode_method == 'ont':
-            traceback = self.posteriors(scores, Max)
+            traceback = self.ont_back_engineered(scores, maxx)
+            # traceback = self.posteriors(scores, Max) # Old ONT code, ont_back_engineered should produce identical results
         elif self.decode_method == 'lookaround':
-            traceback = self.lookaround_scores(scores)
+            traceback = self.la_v2(scores, maxx, self.traceback_lookAhead)
         a_traceback = traceback.argmax(-1)
         moves = (a_traceback % len(self.alphabet)) != 0
         paths = 1 + (torch.div(a_traceback, len(self.alphabet), rounding_mode="floor") % self.n_base)
@@ -229,9 +261,10 @@ class SeqdistModel(Module):
 
     def decode_batch(self, x):
         if self.seqdist.decode_method == 'ont':
-            scores = (self.seqdist.posteriors(x.to(torch.float32)) + 1e-8).log()
+            scores = (self.seqdist.ont_back_engineered(x.to(torch.float32), torch.logsumexp) + 1e-8).log()
+            # scores = (self.seqdist.posteriors(x.to(torch.float32))) # Old ONT code, ont_back_engineered should produce identical results
         elif self.seqdist.decode_method == "lookaround":
-            scores = x
+            scores = (self.seqdist.la_v2(x.to(torch.float32), torch.logsumexp, self.seqdist.probs_lookAhead) + 1e-8).log() # TODO, reduce precision to float16
         else:
             raise ValueError(f'Unknown decode method {self.seqdist.probs_method}')
         tracebacks = self.seqdist.viterbi(scores).to(torch.int16).T
