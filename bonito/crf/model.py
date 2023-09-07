@@ -124,10 +124,11 @@ class CTC_CRF(SequenceDist):
         forward = torch.full((B,NR,),0.,device=inputs.device)
         backward = torch.full((B,NR,),0.,device=inputs.device)
         
-        for i in range(T):
+        for i in range(T): # Forward loop
             alpha_vals[i] = inputs[i] + torch.take(forward,self.idx)
             forward = fxn(alpha_vals[i],-1)
-        for j in reversed(range(T)):
+            
+        for j in reversed(range(T)): # Backward loop
             alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
             z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
             output[j] = (alpha_plus_beta - z).exp()
