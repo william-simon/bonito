@@ -31,7 +31,7 @@ def twoD_softmax(mat):
 
 class CTC_CRF(SequenceDist):
 
-    def __init__(self, state_len, alphabet, n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
+    def __init__(self, state_len, alphabet, device='cuda', n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
         super().__init__()
         print(f'{decode_method}')
         self.alphabet = alphabet
@@ -45,12 +45,12 @@ class CTC_CRF(SequenceDist):
             torch.arange(self.num_rows)[:, None],
             torch.arange(self.num_rows
             ).repeat_interleave(self.n_base).reshape(self.n_base, -1).T
-        ], dim=1).to(torch.int64)
+        ], dim=1).unsqueeze(0).to(device).to(torch.int64)
         next_trans_idx = torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]
         next_blank_idx = torch.arange(0,num_trans, self.n_base + 1).reshape(self.n_base, -1).T
         self.next_idx = torch.cat([next_trans_idx[i] if i%self.n_base != 0 else \
                                 torch.cat([next_blank_idx[i//self.n_base],next_trans_idx[i]]) \
-                                for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).to(torch.int64)
+                                for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).T.unsqueeze(0).to(device).to(torch.int64)
         t = torch.arange(self.num_rows)
         self.next_reorder = torch.cat([t[i::4] for i in range(4)])
         if decode_method != "ont":
@@ -118,24 +118,23 @@ class CTC_CRF(SequenceDist):
     def ont_back_engineered(self, x, fxn):
         T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
         inputs = x.detach().reshape(T, B, NR, NB+1)
-        alpha_vals = inputs.new_full((T, B, NR, NB+1), 0.)
-        beta_vals = inputs.new_full((T, B, NR), math.log(1/NR))
-        alpha_plus_beta = torch.zeros_like(inputs)
+        alpha_vals = torch.zeros_like(inputs)
+        beta_vals = torch.zeros_like(inputs)
         output = torch.zeros_like(inputs)
-        logZ = inputs.new_full((NR,NB,),0.)
-        idx = self.idx.to(dtype=torch.int64, device=inputs.device)
-        next_idx = self.next_idx.to(dtype=torch.int64, device=inputs.device)
+        forward = torch.full((B,NR,),0.,device=inputs.device)
+        backward = torch.full((B,NR,),0.,device=inputs.device)
         
         for i in range(T):
-            alpha_vals[i] = inputs[i] + torch.take(logZ,idx)
-            logZ = fxn(alpha_vals[i],-1)
-        output[T-1] = (alpha_vals[T-1] - fxn(alpha_vals[T-1].flatten(), 0)).exp()
-        for j in reversed(range(T-1)):
-            beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
-            alpha_plus_beta = alpha_vals[j] + beta_vals[j].unsqueeze(-1)
-            z = fxn(alpha_plus_beta.flatten(), 0)
+            alpha_vals[i] = inputs[i] + torch.take(forward,self.idx)
+            forward = fxn(alpha_vals[i],-1)
+        for j in reversed(range(T)):
+            alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
+            z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
             output[j] = (alpha_plus_beta - z).exp()
-            
+            if(j > 0):
+                beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
+                backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
+
         return output.reshape([T,B,-1])
     
     # This code is nearly identical to the above code, except that the reversed for loop that calculates the
@@ -145,30 +144,31 @@ class CTC_CRF(SequenceDist):
         T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
         la = la if la > -1 else T
         inputs = x.detach().reshape(T, B, NR, NB+1)
-        alpha_vals = inputs.new_full((T, B, NR, NB+1), 0.)
-        beta_vals = inputs.new_full((T, B, NR), math.log(1/NR))
-        alpha_plus_beta = torch.zeros_like(inputs)
+        alpha_vals = torch.zeros_like(inputs)
+        beta_vals = torch.zeros_like(inputs)
         output = torch.zeros_like(inputs)
-        logZ = inputs.new_full((NR,NB,),0.)
-        idx = self.idx.to(dtype=torch.int64, device=inputs.device)
-        next_idx = self.next_idx.to(dtype=torch.int64, device=inputs.device)
+        forward = torch.full((B,NR,),0.,device=inputs.device)
+        backward = torch.full((B,NR,),0.,device=inputs.device)
+        
         for i in range(T):
-            alpha_vals[i] = inputs[i] + torch.take(logZ,idx)
-            logZ = fxn(alpha_vals[i],-1)
+            alpha_vals[i] = inputs[i] + torch.take(forward,self.idx)
+            forward = fxn(alpha_vals[i],-1)
             if i >= la:
-                for j in reversed(range(i-la, i)):
-                    beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
-                    
-                alpha_plus_beta = alpha_vals[i-la] + beta_vals[i-la].unsqueeze(-1)
-                z = fxn(alpha_plus_beta.flatten(), 0)
+                backward.zero_()
+                for j in reversed(range(i-la+1, i+1)):
+                    beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
+                    backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
+                alpha_plus_beta = alpha_vals[i-la] + backward.unsqueeze(-1)
+                z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
                 output[i-la] = (alpha_plus_beta - z).exp()
-        output[T-1] = (alpha_vals[T-1] - fxn(alpha_vals[T-1].flatten(), 0)).exp()
-        for j in reversed(range(T-la,T-1)):
-            beta_vals[j] = fxn(torch.take(inputs[j+1] + beta_vals[j+1][0].unsqueeze(-1),next_idx), 0)
-                    
-            alpha_plus_beta = alpha_vals[j] + beta_vals[j].unsqueeze(-1)
-            z = fxn(alpha_plus_beta.flatten(), 0)
+        backward.zero_()
+        for j in reversed(range(T-la,T)):
+            alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
+            z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
             output[j] = (alpha_plus_beta - z).exp()
+            if(j > 0):
+                beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
+                backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
             
         return output.reshape([T,B,-1])
 
