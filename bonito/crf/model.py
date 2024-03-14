@@ -32,7 +32,6 @@ def twoD_softmax(mat):
 class CTC_CRF(SequenceDist):
 
     def __init__(self, state_len, alphabet, device='cuda', n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
-        state_len = 2
         super().__init__()
         print(f'{decode_method}')
         self.alphabet = alphabet
@@ -48,7 +47,7 @@ class CTC_CRF(SequenceDist):
             ).repeat_interleave(self.n_base).reshape(self.n_base, -1).T
         ], dim=1).unsqueeze(0).to(device).to(torch.int64)
         
-        next_trans_idx = ((torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]).reshape(self.n_base, self.num_rows)).T
+        next_trans_idx = ((torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]).T.reshape(self.num_rows, self.n_base))
         next_blank_idx = torch.arange(0,num_trans, self.n_base + 1).reshape(-1, self.num_rows).T
         self.next_idx = (torch.cat([next_blank_idx.T, next_trans_idx.T])).T.to(device).to(torch.int64)
        
