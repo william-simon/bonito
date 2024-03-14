@@ -32,6 +32,7 @@ def twoD_softmax(mat):
 class CTC_CRF(SequenceDist):
 
     def __init__(self, state_len, alphabet, device='cuda', n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
+        state_len = 2
         super().__init__()
         print(f'{decode_method}')
         self.alphabet = alphabet
@@ -46,11 +47,12 @@ class CTC_CRF(SequenceDist):
             torch.arange(self.num_rows
             ).repeat_interleave(self.n_base).reshape(self.n_base, -1).T
         ], dim=1).unsqueeze(0).to(device).to(torch.int64)
-        next_trans_idx = torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]
-        next_blank_idx = torch.arange(0,num_trans, self.n_base + 1).reshape(self.n_base, -1).T
-        self.next_idx = torch.cat([next_trans_idx[i] if i%self.n_base != 0 else \
-                                torch.cat([next_blank_idx[i//self.n_base],next_trans_idx[i]]) \
-                                for i in range(next_trans_idx.shape[0])]).reshape(-1,self.n_base).T.unsqueeze(0).to(device).to(torch.int64)
+        
+        next_trans_idx = ((torch.arange(0,num_trans).reshape(-1,self.n_base + 1)[:,1:]).reshape(self.n_base, self.num_rows)).T
+        next_blank_idx = torch.arange(0,num_trans, self.n_base + 1).reshape(-1, self.num_rows).T
+        self.next_idx = (torch.cat([next_blank_idx.T, next_trans_idx.T])).T.to(device).to(torch.int64)
+       
+        
         t = torch.arange(self.num_rows)
         self.next_reorder = torch.cat([t[i::4] for i in range(4)])
         if decode_method != "ont":
@@ -134,6 +136,7 @@ class CTC_CRF(SequenceDist):
             output[j] = (alpha_plus_beta - z).exp()
             if(j > 0):
                 beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
+                rko = torch.take(beta_vals[j-1], self.next_idx)
                 backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
 
         return output.reshape([T,B,-1])
