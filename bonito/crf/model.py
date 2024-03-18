@@ -29,6 +29,26 @@ def get_stride(m):
 def twoD_softmax(mat):
     return torch.flatten(mat,start_dim=-2).softmax(-1).reshape(*mat.shape)
 
+def scale(self, float_vector,min_int8, max_int8):
+    # Example float tensor with a different range
+    # Determine the range of float values
+    min_float = float_vector.min().item()
+    max_float = float_vector.max().item()
+    # Calculate the scaling factor
+    if max_float == min_float:
+        scaling_factor = max_int8 - min_int8
+    else:
+        scaling_factor = (max_int8 - min_int8) / (max_float - min_float)
+    # Scale, shift, and round
+    scaled_vector = ((float_vector - min_float) * scaling_factor + min_int8).round()
+    # Convert to int8 data type
+    uint8_vector = scaled_vector.to(torch.uint8)
+    return uint8_vector
+    
+def scale_mine(self, float_vector, fixed_point_fractional_bits):
+    uint8_vector = (float_vector*(1 << fixed_point_fractional_bits)).round()
+    return uint8_vector.to(torch.uint8)
+
 class CTC_CRF(SequenceDist):
 
     def __init__(self, state_len, alphabet, device='cuda', n_pre_context_bases=0, n_post_context_bases=0, decode_method="ont"):
@@ -119,6 +139,8 @@ class CTC_CRF(SequenceDist):
     def ont_back_engineered(self, x, fxn):
         T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
         inputs = x.detach().reshape(T, B, NR, NB+1)
+        # inputs = scale(self, inputs, -128, 127)
+        # inputs = scale_mine(self, inputs, 1)
         alpha_vals = torch.zeros_like(inputs)
         beta_vals = torch.zeros_like(inputs)
         output = torch.zeros_like(inputs)
@@ -128,6 +150,7 @@ class CTC_CRF(SequenceDist):
         for i in range(T): # Forward loop
             alpha_vals[i] = inputs[i] + torch.take(forward,self.idx)
             forward = fxn(alpha_vals[i],-1)
+            # forward = scale(self, forward, -128, 127)
             
         for j in reversed(range(T)): # Backward loop
             alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
@@ -135,8 +158,8 @@ class CTC_CRF(SequenceDist):
             output[j] = (alpha_plus_beta - z).exp()
             if(j > 0):
                 beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
-                rko = torch.take(beta_vals[j-1], self.next_idx)
                 backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
+                # backward = scale(self, backward, -128, 127)
 
         return output.reshape([T,B,-1])
     
