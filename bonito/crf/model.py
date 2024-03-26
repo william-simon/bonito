@@ -136,7 +136,7 @@ class CTC_CRF(SequenceDist):
         return torch.cat([blanks, emissions], dim=-1).reshape(T, N, -1)
     
     # This is the original ONT algorithm, it should produce identical results to the C++ ONT code
-    def ont_back_engineered(self, x, fxn):
+    def ont_back_engineered(self, x, fxn, viterbiFlag=False):
         T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
         inputs = x.detach().reshape(T, B, NR, NB+1)
         # inputs = scale(self, inputs, -128, 127)
@@ -156,6 +156,8 @@ class CTC_CRF(SequenceDist):
             alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
             z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
             output[j] = (alpha_plus_beta - z).exp()
+            if viterbiFlag:
+                output[j] = alpha_plus_beta 
             if(j > 0):
                 beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
                 backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
@@ -166,7 +168,7 @@ class CTC_CRF(SequenceDist):
     # This code is nearly identical to the above code, except that the reversed for loop that calculates the
     # beta values can start early within the first for loop, as dictated by the lookaround (la) value 
     # passed to it.
-    def la_v2(self, x, fxn, la = -1):
+    def la_v2(self, x, fxn, la = -1, viterbiFlag=False):
         T, B, NR, NB = x.shape[0], x.shape[1], self.num_rows, self.n_base
         la = la if la > -1 else T
         inputs = x.detach().reshape(T, B, NR, NB+1)
@@ -187,11 +189,15 @@ class CTC_CRF(SequenceDist):
                 alpha_plus_beta = alpha_vals[i-la] + backward.unsqueeze(-1)
                 z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
                 output[i-la] = (alpha_plus_beta - z).exp()
+                if viterbiFlag:
+                    output[i-la] = alpha_plus_beta 
         backward.zero_()
         for j in reversed(range(T-la,T)):
             alpha_plus_beta = alpha_vals[j] + backward.unsqueeze(-1)
             z = fxn(alpha_plus_beta.flatten(), 0) # <-- Normalization and exp probably optional
             output[j] = (alpha_plus_beta - z).exp()
+            if viterbiFlag:
+                output[j] = alpha_plus_beta 
             if(j > 0):
                 beta_vals[j-1] = inputs[j] + backward.unsqueeze(-1)
                 backward = fxn(torch.take(beta_vals[j-1], self.next_idx), -1)
@@ -200,10 +206,10 @@ class CTC_CRF(SequenceDist):
 
     def viterbi(self, scores):
         if self.decode_method == 'ont':
-            traceback = self.ont_back_engineered(scores, maxx)
+            traceback = self.ont_back_engineered(scores, maxx, True)
             # traceback = self.posteriors(scores, Max) # Old ONT code, ont_back_engineered should produce identical results
         elif self.decode_method == 'lookaround':
-            traceback = self.la_v2(scores, maxx, self.traceback_lookAhead)
+            traceback = self.la_v2(scores, maxx, self.traceback_lookAhead, True)
         a_traceback = traceback.argmax(-1)
         moves = (a_traceback % len(self.alphabet)) != 0
         paths = 1 + (torch.div(a_traceback, len(self.alphabet), rounding_mode="floor") % self.n_base)
@@ -287,10 +293,10 @@ class SeqdistModel(Module):
 
     def decode_batch(self, x):
         if self.seqdist.decode_method == 'ont':
-            scores = (self.seqdist.ont_back_engineered(x.to(torch.float32), torch.logsumexp) + 1e-8).log()
+            scores = (self.seqdist.ont_back_engineered(x.to(torch.float32), torch.logsumexp, False) + 1e-8).log()
             # scores = (self.seqdist.posteriors(x.to(torch.float32))) # Old ONT code, ont_back_engineered should produce identical results
         elif self.seqdist.decode_method == "lookaround":
-            scores = (self.seqdist.la_v2(x.to(torch.float32), torch.logsumexp, self.seqdist.probs_lookAhead) + 1e-8).log() # TODO, reduce precision to float16
+            scores = (self.seqdist.la_v2(x.to(torch.float32), torch.logsumexp, self.seqdist.probs_lookAhead, False) + 1e-8).log() # TODO, reduce precision to float16
         else:
             raise ValueError(f'Unknown decode method {self.seqdist.probs_method}')
         tracebacks = self.seqdist.viterbi(scores).to(torch.int16).T
